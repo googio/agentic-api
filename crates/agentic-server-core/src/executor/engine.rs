@@ -20,7 +20,7 @@ use std::num::NonZeroUsize;
 #[cfg(test)]
 use either::Either;
 
-use super::compaction::compact_items;
+use super::compaction::{carried_over_inputs, compact_items};
 use super::gateway::{
     compaction_event_plans, emit_gateway_completed_events, emit_gateway_start_events, emit_response_start_events,
 };
@@ -32,6 +32,8 @@ use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
 #[cfg(test)]
 use crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES;
+use crate::executor::telemetry::Api;
+use crate::executor::telemetry::metrics::RoundCounter;
 use crate::tool::{ToolSearchMetadata, ToolSearchState};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput};
 #[cfg(test)]
@@ -63,10 +65,12 @@ async fn run_until_gateway_tools_complete(
         emit_gateway_completed_events(&payload.output, &event_plans, relay).await?;
         return Ok((payload, tool_search_metadata));
     }
-    EngineOrchestration::new(agent, exec_ctx)
-        .await?
-        .run(auth, stream_upstream)
-        .await
+    Box::pin(
+        EngineOrchestration::new(agent, exec_ctx)
+            .await?
+            .run(auth, stream_upstream),
+    )
+    .await
 }
 
 /// Response-level orchestration. Owns the shared retained-byte budget and
@@ -113,8 +117,7 @@ impl<'a> EngineOrchestration<'a> {
                 coordinator,
                 pipeline,
                 exec_ctx,
-            } => coordinator
-                .run(pipeline, exec_ctx, auth)
+            } => Box::pin(coordinator.run(pipeline, exec_ctx, auth))
                 .await
                 .map(|payload| (payload, None)),
         }
@@ -126,6 +129,7 @@ struct SingleAgentRun<'a> {
     response_budget: ExecutorResponseBudget,
     output: Vec<OutputItem>,
     usage: Option<ResponseUsage>,
+    rounds: RoundCounter,
 }
 
 impl<'a> SingleAgentRun<'a> {
@@ -138,6 +142,7 @@ impl<'a> SingleAgentRun<'a> {
             response_budget,
             output,
             usage: None,
+            rounds: exec_ctx.metrics.rounds(Api::Responses),
         })
     }
 
@@ -147,6 +152,7 @@ impl<'a> SingleAgentRun<'a> {
         stream_upstream: bool,
     ) -> ExecutorResult<(ResponsePayload, Option<ToolSearchMetadata>)> {
         loop {
+            self.rounds.begin_round();
             let RoundResult { mut payload, decision } = self
                 .root
                 .run_round(self.output.len(), auth, stream_upstream, &self.response_budget)
@@ -188,10 +194,18 @@ async fn run_compaction_trigger(
         MultiAgentRun::compact_root(ctx, exec_ctx, auth).await?
     } else {
         let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
+        // Earlier open async calls stay visible through the compaction window. The request's late
+        // outputs and its own open calls would be dropped with the items this turn replaces, so they
+        // are stored again, before the compaction output.
+        let carried = match &input {
+            ResponsesInput::Items(items) => carried_over_inputs(items, &ctx.new_input_items),
+            ResponsesInput::Text(_) => Vec::new(),
+        };
         let (mut compacted, usage, service_tier) = compact_items(&ctx.enriched_request, input, exec_ctx, auth).await?;
         let Some(InputItem::Compaction(compaction)) = compacted.pop() else {
             unreachable!("compact_items always appends a compaction item");
         };
+        compacted.extend(carried);
         ctx.new_input_items = compacted;
         if let Some(continuation) = &mut ctx.continuation {
             continuation.mark_history_replaced();
@@ -215,6 +229,7 @@ async fn run_compaction_trigger(
         service_tier,
         tools: None,
         tool_choice: None,
+        standard_fields: crate::types::request_response::StandardResponseFields::default(),
     };
     ctx.inject_ids(&mut payload);
     Ok(payload)
@@ -247,7 +262,15 @@ async fn run_blocking(
 
     let ch = exec_ctx.conv_handler.clone();
     let rh = exec_ctx.resp_handler.clone();
-    persist_if_needed(payload.clone(), ctx, tool_search_metadata, ch, rh).await?;
+    Box::pin(persist_if_needed(
+        payload.clone(),
+        ctx,
+        tool_search_metadata,
+        ch,
+        rh,
+        &exec_ctx.metrics,
+    ))
+    .await?;
 
     Ok(payload)
 }
@@ -718,7 +741,7 @@ mod tests {
         let model_input = ResponsesInput::Items(InOutItem::into_input_items(history));
         let serialized = serde_json::to_value(model_input.model_input()).expect("model input serializes");
         assert_eq!(serialized.as_array().map(Vec::len), Some(2));
-        assert_eq!(serialized[0]["content"], "remember banana");
+        assert_eq!(serialized[0]["content"][0]["text"], "remember banana");
         assert_eq!(serialized[1]["role"], "assistant");
         assert_eq!(serialized[1]["content"][0]["text"], "durable summary");
         server.abort();

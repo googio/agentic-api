@@ -9,6 +9,7 @@ use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::prepare::prepare_request_tools;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::telemetry::metrics::{ExecutorMetrics, Stage};
 use crate::storage::{InOutItem, ResponseMetadata};
 use crate::tool::{ToolSearchMetadata, ToolSearchState};
 use crate::types::event::ResponseStatus;
@@ -28,24 +29,29 @@ pub(crate) fn should_persist(ctx: &RequestContext) -> bool {
     ctx.continuation.is_some() || ctx.original_request.store || ctx.original_request.conversation.is_some()
 }
 
+/// Persist when the request asked for it; only an attempted write is timed
+/// as a `persist` stage.
 pub(crate) async fn persist_if_needed(
     payload: ResponsePayload,
     ctx: RequestContext,
     tool_search_metadata: Option<ToolSearchMetadata>,
     conv_handler: ConversationHandler,
     resp_handler: ResponseHandler,
+    metrics: &ExecutorMetrics,
 ) -> ExecutorResult<()> {
-    if should_persist(&ctx) {
-        match persist_prepared_response(payload, ctx, tool_search_metadata, conv_handler, resp_handler).await {
-            Err(error @ (ExecutorError::Conflict(_) | ExecutorError::PayloadTooLarge(_))) => Err(error),
-            Err(source) => {
-                error!(error = ?source, "failed to persist response");
-                Err(ExecutorError::Persistence(Box::new(source)))
-            }
-            Ok(()) => Ok(()),
+    if !should_persist(&ctx) {
+        return Ok(());
+    }
+    let timer = metrics.stage(Stage::Persist);
+    let persisted = persist_prepared_response(payload, ctx, tool_search_metadata, conv_handler, resp_handler).await;
+    timer.finish_result(&persisted);
+    match persisted {
+        Err(error @ (ExecutorError::Conflict(_) | ExecutorError::PayloadTooLarge(_))) => Err(error),
+        Err(source) => {
+            error!(error = ?source, "failed to persist response");
+            Err(ExecutorError::Persistence(Box::new(source)))
         }
-    } else {
-        Ok(())
+        Ok(()) => Ok(()),
     }
 }
 
@@ -222,6 +228,7 @@ pub async fn commit(
         None,
         exec_ctx.conv_handler.clone(),
         exec_ctx.resp_handler.clone(),
+        &exec_ctx.metrics,
     ))
     .await?;
     Ok(payload)
@@ -259,12 +266,15 @@ async fn validate_output_call_ids(
     if ctx.continuation.is_some() {
         // Rehydration already combined the pinned parent with normalized input.
         // Validate that effective window, excluding calls superseded by compaction.
-        return validate_history_call_ids(ctx.enriched_request.input.model_items().map(input_call_id), &call_ids);
+        return validate_history_call_ids(
+            ctx.enriched_request.input.model_items().map(InputItem::call_id),
+            &call_ids,
+        );
     }
     let history = resp_handler.rehydrate(ctx).await?;
     validate_history_call_ids(history.iter().map(stored_call_id), &call_ids)?;
     for (input_index, item) in ctx.new_input_items.iter().enumerate() {
-        if let Some((output_index, item_type)) = input_call_id(item).and_then(|call_id| call_ids.get(call_id)) {
+        if let Some((output_index, item_type)) = item.call_id().and_then(|call_id| call_ids.get(call_id)) {
             return Err(ExecutorError::InvalidRequest(format!(
                 "upstream response output[{output_index}] {item_type} repeats 'call_id' from request input[{input_index}]"
             )));
@@ -289,21 +299,11 @@ fn validate_history_call_ids<'a>(
 
 fn stored_call_id(item: &InOutItem) -> Option<&str> {
     match item {
-        InOutItem::Input(item) => input_call_id(item),
+        InOutItem::Input(item) => item.call_id(),
         InOutItem::Output(OutputItem::FunctionCall(call)) => Some(&call.call_id),
         InOutItem::Output(OutputItem::ToolSearchCall(call)) => Some(&call.call_id),
         InOutItem::Output(OutputItem::CustomToolCall(call)) => Some(&call.call_id),
         InOutItem::Output(OutputItem::ShellCall(call)) => Some(&call.call_id),
         InOutItem::Output(_) => None,
-    }
-}
-
-fn input_call_id(item: &InputItem) -> Option<&str> {
-    match item {
-        InputItem::FunctionCall(call) => Some(&call.call_id),
-        InputItem::ToolSearchCall(call) => Some(&call.call_id),
-        InputItem::CustomToolCall(call) => Some(&call.call_id),
-        InputItem::ShellCall(call) => Some(&call.call_id),
-        _ => None,
     }
 }

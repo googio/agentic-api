@@ -52,7 +52,8 @@ pub(crate) fn insert_namespace_entries(entries: &mut HashMap<String, ToolEntry>,
         if entries
             .insert(
                 name.clone(),
-                ToolEntry::client(ToolType::CodexNamespace, Some(p.name.clone())),
+                ToolEntry::client(ToolType::CodexNamespace, Some(p.name.clone()))
+                    .with_async_execution(function.is_async()),
             )
             .is_some()
         {
@@ -130,13 +131,13 @@ impl NamespaceMapBuilder {
                 tool_kind.description()
             )));
         }
-        if let Some(existing) = self.map.calls.get(&flat_name) {
-            if existing.member.namespace != namespace_name || existing.member.name != member_name {
-                return Err(ToolError::Config(format!(
-                    "codex namespace member {namespace_name}.{member_name} collides with {}.{} at generated name {flat_name}",
-                    existing.member.namespace, existing.member.name
-                )));
-            }
+        if let Some(existing) = self.map.calls.get(&flat_name)
+            && (existing.member.namespace != namespace_name || existing.member.name != member_name)
+        {
+            return Err(ToolError::Config(format!(
+                "codex namespace member {namespace_name}.{member_name} collides with {}.{} at generated name {flat_name}",
+                existing.member.namespace, existing.member.name
+            )));
         }
         Ok(self.record_flat_member_with_flat_name(namespace_name, member_name, flat_name))
     }
@@ -327,7 +328,9 @@ impl ToolHandler for CodexNamespaceHandler {
             .tools
             .iter()
             .filter_map(|member| match member {
-                CodexNamespaceMember::Function(function) => Some(FunctionTool::from(function)),
+                CodexNamespaceMember::Function(function) => {
+                    Some(super::function::FunctionHandler::model_visible_tool(function))
+                }
                 CodexNamespaceMember::Unknown => None,
             })
             .collect()

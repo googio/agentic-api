@@ -697,12 +697,12 @@ async fn test_public_persist_steps_honor_the_storage_policy() {
                 "status": "completed", "content": [{"type": "output_text", "text": "public answer"}]}]
         }))
         .expect("completed payload");
-        persist_response(
+        Box::pin(persist_response(
             payload,
             ctx,
             exec_ctx.conv_handler.clone(),
             exec_ctx.resp_handler.clone(),
-        )
+        ))
         .await
         .expect("persist_response");
         assert_eq!(
@@ -1020,6 +1020,7 @@ async fn test_previous_response_id_persists_inherited_tools_and_choice() {
         })),
         strict: Some(true),
         defer_loading: None,
+        async_execution: None,
         extra: std::collections::HashMap::new(),
     });
 

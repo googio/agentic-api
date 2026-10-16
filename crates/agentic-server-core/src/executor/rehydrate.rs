@@ -6,8 +6,9 @@
 use super::session::{ResponseCheckpoint, ResponseContinuation, ResponseSession, canonical_session_history};
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::multi_agent::{CheckpointLimits, ValidatedTreeCheckpoint};
-use crate::executor::pending_calls::pending_calls;
+use crate::executor::pending_calls::first_unanswered_sync_call;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::telemetry::metrics::Stage;
 use crate::storage::{InOutItem, ResponseMetadata};
 use crate::tool::ToolError;
 use crate::types::io::{
@@ -168,6 +169,18 @@ pub(crate) async fn rehydrate_with_continuation(
     exec_ctx: &ExecutionContext,
     continuation: Option<ResponseContinuation>,
 ) -> ExecutorResult<RequestContext> {
+    let timer = exec_ctx.metrics.stage(Stage::Rehydrate);
+    // Boxed so this wrapper does not hold the request payload twice.
+    let rehydrated = Box::pin(rehydrate_request(request, exec_ctx, continuation)).await;
+    timer.finish_result(&rehydrated);
+    rehydrated
+}
+
+async fn rehydrate_request(
+    request: RequestPayload,
+    exec_ctx: &ExecutionContext,
+    continuation: Option<ResponseContinuation>,
+) -> ExecutorResult<RequestContext> {
     validate_multi_agent_request(&request)?;
     // Stored turns never supply `max_tool_calls`, so the request value is final here.
     request.max_tool_calls_limit()?;
@@ -239,6 +252,14 @@ fn validate_multi_agent_request(request: &RequestPayload) -> ExecutorResult<()> 
             "max_tool_calls is not supported with multi_agent".into(),
         ));
     }
+    // OpenAI rejects this combination with the same parameter and message. The gateway defaults
+    // `parallel_tool_calls` to false, so only an explicit `true` conflicts.
+    if request.parallel_tool_calls == Some(true) && request.declares_async_tools() {
+        return Err(ExecutorError::UnsupportedValue {
+            param: "multi_agent",
+            message: "Async parallel tool calls are not yet supported in multi-agent mode.",
+        });
+    }
     if request
         .reasoning
         .as_ref()
@@ -270,7 +291,7 @@ async fn from_response(ctx: &mut RequestContext, exec_ctx: &ExecutionContext) ->
     let mut items = InOutItem::into_input_items(history);
     items.reserve(ctx.new_input_items.len());
     items.extend(Vec::from(&ctx.original_request.input));
-    if let Some(pending) = pending_calls(&items)?.into_iter().next() {
+    if let Some(pending) = first_unanswered_sync_call(&items)? {
         return Err(ExecutorError::Tool(ToolError::MissingOutput {
             call_id: pending.call_id,
         }));
@@ -327,7 +348,7 @@ async fn from_session_response(ctx: &mut RequestContext, exec_ctx: &ExecutionCon
     // inference copy. new_input_items retains their public wire types.
     items.extend(Vec::from(&ctx.original_request.input));
     let items = canonical_session_history(items);
-    if let Some(pending) = pending_calls(&items)?.into_iter().next() {
+    if let Some(pending) = first_unanswered_sync_call(&items)? {
         return Err(ExecutorError::Tool(ToolError::MissingOutput {
             call_id: pending.call_id,
         }));
@@ -370,18 +391,17 @@ async fn from_conversation(ctx: &mut RequestContext, exec_ctx: &ExecutionContext
         .conv_handler
         .response_metadata_at_version(ctx, &snapshot.version)
         .await?
+        && restore_agent_tree(ctx, &metadata, exec_ctx.responses_config.max_retained_bytes)?
     {
-        if restore_agent_tree(ctx, &metadata, exec_ctx.responses_config.max_retained_bytes)? {
-            ctx.conversation_id = Some(conv_data.conversation_id);
-            ctx.conversation_version = Some(snapshot.version);
-            return Ok(());
-        }
+        ctx.conversation_id = Some(conv_data.conversation_id);
+        ctx.conversation_version = Some(snapshot.version);
+        return Ok(());
     }
 
     let mut items = InOutItem::into_input_items(snapshot.items);
     items.reserve(ctx.new_input_items.len());
     items.extend(Vec::from(&ctx.original_request.input));
-    if let Some(pending) = pending_calls(&items)?.into_iter().next() {
+    if let Some(pending) = first_unanswered_sync_call(&items)? {
         return Err(ExecutorError::Tool(ToolError::MissingOutput {
             call_id: pending.call_id,
         }));
@@ -453,6 +473,7 @@ mod tests {
 
     use super::*;
     use crate::executor::modes::{ConversationHandler, ResponseHandler};
+    use crate::executor::pending_calls::pending_calls;
     use crate::storage::{
         ConversationStore, ConversationVersion, InOutItem, ResponseMetadata, ResponseStore, create_pool_with_schema,
     };
@@ -761,6 +782,38 @@ mod tests {
         }
     }
 
+    /// Recorded `OpenAI` behavior: multi-agent mode rejects async tools with explicit parallel tool
+    /// calls, and accepts them with parallel calls off. The gateway's default is `false`.
+    #[test]
+    fn multi_agent_rejects_async_tools_only_with_explicit_parallel_tool_calls() {
+        let request = |parallel: serde_json::Value, async_tool: bool| -> RequestPayload {
+            serde_json::from_value(serde_json::json!({
+                "model": "test", "input": "hello", "store": true,
+                "multi_agent": {"enabled": true},
+                "parallel_tool_calls": parallel,
+                "tools": [{"type": "function", "name": "get_weather", "async": async_tool}]
+            }))
+            .unwrap()
+        };
+
+        let error = validate_multi_agent_request(&request(serde_json::json!(true), true)).unwrap_err();
+        assert!(matches!(
+            error,
+            ExecutorError::UnsupportedValue {
+                param: "multi_agent",
+                message: "Async parallel tool calls are not yet supported in multi-agent mode."
+            }
+        ));
+        for (parallel, async_tool) in [
+            (serde_json::json!(false), true),
+            (serde_json::Value::Null, true),
+            (serde_json::json!(true), false),
+        ] {
+            validate_multi_agent_request(&request(parallel.clone(), async_tool))
+                .unwrap_or_else(|error| panic!("parallel={parallel} async={async_tool}: {error}"));
+        }
+    }
+
     #[tokio::test]
     async fn inherited_multi_agent_rejects_max_tool_calls() {
         let pool = create_pool_with_schema(Some("sqlite://?mode=memory")).await.unwrap();
@@ -1060,7 +1113,7 @@ mod tests {
             .await
             .expect_err("shared call validation rejects orphan stored search outputs");
         assert!(
-            matches!(&error, ExecutorError::InvalidRequest(message) if message.contains("without a pending call")),
+            matches!(&error, ExecutorError::Tool(ToolError::UnknownCallOutput { call_id }) if call_id == "call_search_1"),
             "unexpected error: {error}"
         );
         assert_eq!(error.http_status(), http::StatusCode::BAD_REQUEST);

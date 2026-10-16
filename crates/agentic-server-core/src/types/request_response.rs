@@ -7,16 +7,21 @@ use serde_json::{Map, Value};
 
 use super::io::{FunctionTool, InputItem, MultiAgentConfig, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
-use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, responses_declarations};
+use crate::tool::async_execution::lower_async_calls;
+use crate::tool::{
+    CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, declares_async, responses_declarations,
+};
 
 mod max_tool_calls;
 mod response_stream;
 mod serde_helpers;
+mod standard_response;
 pub use max_tool_calls::{JsonKind, MAX_TOOL_CALLS_PARAM, MaxToolCalls, MaxToolCallsError, OutOfRangeInteger};
 use serde_helpers::{
     default_true, deserialize_conversation, is_absent_or_default_tool_choice, serialize_conversation_object,
     serialize_upstream_tool_choice,
 };
+pub use standard_response::{ResponseReasoning, StandardResponseFields};
 #[cfg(feature = "openapi")]
 mod schema;
 
@@ -211,6 +216,14 @@ impl<T: ?Sized> RequestPayload<T> {
         self.max_tool_calls.as_ref().map(MaxToolCalls::limit).transpose()
     }
 
+    /// Whether any declared tool makes a model-visible tool async.
+    #[must_use]
+    pub fn declares_async_tools(&self) -> bool {
+        self.tools
+            .as_deref()
+            .is_some_and(|tools| tools.iter().any(declares_async))
+    }
+
     /// Names the feature in this request that only the in-process executor
     /// implements, if any — neither the passthrough proxy nor split execution
     /// can serve it.
@@ -228,6 +241,10 @@ impl<T: ?Sized> RequestPayload<T> {
             .is_some_and(|tools| tools.iter().any(|tool| !matches!(tool, ResponsesTool::Function(_))))
         {
             return Some("gateway-owned tools");
+        }
+        // The gateway emulates async tools: the model server neither marks nor continues them.
+        if self.declares_async_tools() || self.input.has_async_call() {
+            return Some("async tools");
         }
         if self.input.contains_compaction() || self.input.has_compaction_trigger() {
             return Some("compaction input");
@@ -334,7 +351,9 @@ impl RequestPayload {
         });
         let tools = tools.filter(|tools| !tools.is_empty());
         let namespace_map = CodexNamespaceHandler.build_namespace_map(declarations.as_deref())?;
-        let input = CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input());
+        let input = lower_async_calls(
+            CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input()),
+        );
         let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
         CustomHandler::validate_tool_choice(declarations.as_deref(), &tool_choice)?;
         Ok(UpstreamRequest {
@@ -438,12 +457,14 @@ pub struct ResponsePayload {
     /// The request's `max_tool_calls`, always echoed (`null` when unset). Never inherited.
     #[serde(default)]
     pub max_tool_calls: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_service_tier")]
     pub service_tier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_tools")]
     pub tools: Option<Vec<ResponsesTool>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_tool_choice")]
     pub tool_choice: Option<ToolChoice>,
+    #[serde(flatten)]
+    pub standard_fields: StandardResponseFields,
 }
 
 #[cfg(test)]
@@ -580,6 +601,35 @@ mod tests {
         assert_eq!(payload.in_process_feature(), None);
     }
 
+    /// A stateless request with only function tools normally goes straight to the model server,
+    /// which ignores `async`; async tools and replayed async calls need the executor.
+    #[test]
+    fn async_tools_and_replayed_async_calls_require_the_executor() {
+        let request = |tools: serde_json::Value, input: serde_json::Value| -> RequestPayload {
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model", "store": false, "tools": tools, "input": input
+            }))
+            .unwrap()
+        };
+        let sync_tool = serde_json::json!([{"type": "function", "name": "get_weather"}]);
+        let async_tool = serde_json::json!([{"type": "function", "name": "get_weather", "async": true}]);
+        let call = |async_execution: bool| {
+            serde_json::json!([{"type": "function_call", "call_id": "call_1", "name": "get_weather",
+                "arguments": "{}", "async": async_execution}])
+        };
+
+        assert_eq!(request(sync_tool.clone(), call(false)).in_process_feature(), None);
+        assert_eq!(
+            request(async_tool, serde_json::json!("hi")).in_process_feature(),
+            Some("async tools")
+        );
+        assert_eq!(
+            request(sync_tool, call(true)).in_process_feature(),
+            Some("async tools"),
+            "a replayed async call keeps executor semantics after the tool is re-declared"
+        );
+    }
+
     #[test]
     fn request_payload_accepts_openai_conversation_field() {
         let request: RequestPayload = serde_json::from_value(serde_json::json!({
@@ -638,6 +688,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
             max_tool_calls: None,
         };
 
@@ -665,6 +716,7 @@ mod tests {
             tools: None,
             max_tool_calls: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let json = serde_json::to_value(&payload).expect("response should serialize");
@@ -1415,6 +1467,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         for (status, expected_type) in [
@@ -1454,6 +1507,7 @@ mod tests {
             service_tier: None,
             tools: Some(vec![tool]),
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let response = serde_json::to_value(&payload).expect("blocking response");
@@ -1484,6 +1538,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let chunk = payload.as_created_response_chunk();

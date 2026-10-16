@@ -1,9 +1,17 @@
 mod estimate;
 pub(crate) use estimate::{estimate_history_tokens, estimate_input_tokens};
 
+mod carry_over;
 mod context;
 mod summary;
 
+pub(crate) use carry_over::carried_over_inputs;
+use carry_over::{CompactionCarryOver, public_calls};
+
+use std::collections::{HashMap, HashSet};
+
+use super::telemetry::FailureCategory;
+use super::telemetry::metrics::Stage;
 use super::telemetry::stages::CompactionTrigger;
 use context::item_has_meaningful_context;
 use summary::completed_summary_text;
@@ -19,12 +27,15 @@ use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::upstream::fetch_blocking_payload;
 use crate::tool::ToolSearchState;
 use crate::types::event::MessageStatus;
-use crate::types::io::input::latest_compaction_window;
-use crate::types::io::{CompactionItem, InputItem, InputMessage, InputMessageContent, ResponseUsage, ResponsesInput};
+use crate::types::io::input::{InputTextContent, latest_compaction_window};
+use crate::types::io::{
+    CompactionItem, InputContent, InputItem, InputMessage, InputMessageContent, ResponseUsage, ResponsesInput,
+};
 use crate::types::request_response::{CompactRequest, CompactedResponse, RequestPayload};
 use crate::utils::common::{utcnow_str, uuid7_str};
 
 const COMPACTION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a concise handoff summary that preserves current progress, decisions, constraints, unresolved work, and critical references for the next model. Return only the summary.";
+
 fn retained_user_window(items: &[InputItem]) -> Vec<InputItem> {
     let window = latest_compaction_window(items);
     items
@@ -42,6 +53,10 @@ fn retained_user_window(items: &[InputItem]) -> Vec<InputItem> {
             let mut retained = message.clone();
             retained.id = Some(uuid7_str("msg_"));
             retained.status = Some(MessageStatus::Completed);
+            if let InputMessageContent::Text(text) = &retained.content {
+                retained.content =
+                    InputMessageContent::Parts(vec![InputContent::InputText(InputTextContent::new(text.clone()))]);
+            }
             Some(InputItem::Message(retained))
         })
         .collect()
@@ -117,6 +132,18 @@ async fn compact_items_with_trigger(
     auth: Option<&str>,
     trigger: CompactionTrigger,
 ) -> ExecutorResult<(Vec<InputItem>, ResponseUsage, Option<String>)> {
+    let timer = exec_ctx.metrics.stage(Stage::Compaction);
+    let summarized = summarize_items(request, input, exec_ctx, auth).await;
+    timer.finish_result(&summarized);
+    summarized
+}
+
+async fn summarize_items(
+    request: &RequestPayload,
+    input: ResponsesInput,
+    exec_ctx: &ExecutionContext,
+    auth: Option<&str>,
+) -> ExecutorResult<(Vec<InputItem>, ResponseUsage, Option<String>)> {
     let original_items = Vec::from(input);
     if !original_items.iter().any(item_has_meaningful_context) {
         return Err(ExecutorError::InvalidRequest(
@@ -161,6 +188,7 @@ async fn compact_items_with_trigger(
     let mut agent = AgentPipeline::new(ctx, None, StreamRelay::detached());
     let response =
         fetch_blocking_payload(&mut agent, exec_ctx, auth, &crate::tool::ToolRegistry::default(), None).await?;
+    exec_ctx.metrics.record_response_usage(response.usage.as_ref());
     let summary = completed_summary_text(&response)?;
 
     Ok((
@@ -219,6 +247,17 @@ pub(crate) async fn maybe_compact_context(
     if !items[..prefix].iter().any(item_has_meaningful_context) {
         return Ok(None);
     }
+    // Single-agent compaction covers every item. Items stored again come from the request's own
+    // public items; the model input may keep a lowered call, which the model sees lowered anyway.
+    let compacted_items = match (&ctx.enriched_request.input, multi_agent) {
+        (ResponsesInput::Items(model_items), false) => model_items.as_slice(),
+        _ => &items[..prefix],
+    };
+    let suffix = if multi_agent { &items[prefix..] } else { &[][..] };
+    let (open_calls, carried) = {
+        let carry = CompactionCarryOver::new(compacted_items, &ctx.new_input_items, suffix);
+        (carry.open_calls().cloned().collect::<Vec<_>>(), carry.stored())
+    };
     let input = ResponsesInput::Items(items[..prefix].to_vec());
     let (mut compacted, usage, _) = compact_items_with_trigger(
         &ctx.enriched_request,
@@ -235,10 +274,14 @@ pub(crate) async fn maybe_compact_context(
                 .filter(|item| matches!(item, InputItem::McpListTools(_)))
                 .cloned(),
         );
-        compacted.extend_from_slice(&items[prefix..]);
     }
-    ctx.enriched_request.input = ResponsesInput::Items(compacted.clone());
-    ctx.new_input_items = compacted;
+    let mut model_input = compacted.clone();
+    model_input.extend(open_calls);
+    model_input.extend_from_slice(suffix);
+    let mut stored = carried.insert_into(compacted);
+    stored.extend_from_slice(suffix);
+    ctx.enriched_request.input = ResponsesInput::Items(model_input);
+    ctx.new_input_items = stored;
     if let Some(continuation) = &mut ctx.continuation {
         continuation.mark_history_replaced();
     }
@@ -276,7 +319,29 @@ pub async fn compact_response(
         prepare_request_tools(ctx, &exec_ctx.conv_handler, &exec_ctx.resp_handler).await?;
     let tool_search_metadata = tool_search_state.map(ToolSearchState::into_public_metadata);
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (output, usage, service_tier) = compact_items_with_trigger(
+    // The returned window keeps every open async call, in its public form, so a client replaying it
+    // stays self-contained; storage adds only this request's own items (see `CompactionCarryOver`).
+    let (open_calls, carried) = match &input {
+        ResponsesInput::Items(items) => {
+            let carry = CompactionCarryOver::new(items, &ctx.new_input_items, &[]);
+            (carry.open_calls().cloned().collect::<Vec<_>>(), carry.stored())
+        }
+        ResponsesInput::Text(_) => (Vec::new(), CompactionCarryOver::new(&[], &[], &[]).stored()),
+    };
+    // A history call's public identity comes from what was stored, not from the tools this request
+    // declares: the model input above lowered it, and the declarations may have changed since.
+    // History is read again only when an open call came from it.
+    let from_history: HashSet<&str> = open_calls
+        .iter()
+        .filter_map(InputItem::call_id)
+        .filter(|call_id| !ctx.new_input_items.iter().any(|own| own.call_id() == Some(call_id)))
+        .collect();
+    let mut history_calls = if from_history.is_empty() {
+        HashMap::new()
+    } else {
+        public_calls(exec_ctx.resp_handler.rehydrate(&ctx).await?, &from_history)
+    };
+    let (compacted, usage, service_tier) = compact_items_with_trigger(
         &ctx.enriched_request,
         input,
         exec_ctx,
@@ -284,9 +349,23 @@ pub async fn compact_response(
         CompactionTrigger::Explicit,
     )
     .await?;
+    // A call this request supplied is already public; a call from history takes its stored form.
+    let public_call = |item: InputItem| -> InputItem {
+        let public = item.call_id().and_then(|call_id| {
+            ctx.new_input_items
+                .iter()
+                .find(|own| own.call_id() == Some(call_id))
+                .cloned()
+                .or_else(|| history_calls.remove(call_id))
+        });
+        public.unwrap_or(item)
+    };
+    let mut output = compacted.clone();
+    output.extend(open_calls.into_iter().map(public_call));
 
     let response_id = ctx.response_id.clone();
-    ctx.new_input_items.clone_from(&output);
+    ctx.new_input_items = carried.insert_into(compacted);
+    let timer = exec_ctx.metrics.stage(Stage::Persist);
     match persist_prepared_turn(
         ctx,
         tool_search_metadata,
@@ -297,8 +376,13 @@ pub async fn compact_response(
     )
     .await
     {
-        Ok(()) | Err(ExecutorError::Storage(crate::StorageError::NotConfigured)) => {}
-        Err(error) => return Err(error),
+        Ok(()) => timer.finish(None),
+        // Without storage nothing was written, so there is no stage to time.
+        Err(ExecutorError::Storage(crate::StorageError::NotConfigured)) => timer.discard(),
+        Err(error) => {
+            timer.finish(Some(FailureCategory::from(&error)));
+            return Err(error);
+        }
     }
 
     Ok(CompactedResponse {
@@ -1145,7 +1229,7 @@ mod tests {
         let serialized = serde_json::to_value(model_input.model_input()).expect("model input serializes");
 
         assert_eq!(serialized.as_array().map(Vec::len), Some(2));
-        assert_eq!(serialized[0]["content"], "remember banana");
+        assert_eq!(serialized[0]["content"][0]["text"], "remember banana");
         assert_eq!(serialized[1]["role"], "assistant");
         assert_eq!(serialized[1]["content"][0]["text"], "durable summary");
         server.abort();
