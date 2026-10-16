@@ -134,6 +134,7 @@ fn search_response() -> serde_json::Value {
 
 fn call(arguments: &str) -> FunctionToolCall {
     FunctionToolCall {
+        async_execution: false,
         agent: None,
         id: "fc_serply".to_owned(),
         call_id: "call_serply".to_owned(),
