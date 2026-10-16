@@ -229,7 +229,7 @@ async fn serply_handler_sends_site_operators_and_filters_client_side() {
     let request = captured.recv().await.unwrap();
     assert_eq!(
         request.params,
-        serde_json::json!({"q": "rust async site:Example.com after:2026-01-02 before:2026-02-04"})
+        serde_json::json!({"q": "rust async after:2026-01-02 before:2026-02-04 site:Example.com"})
     );
     let output_json: serde_json::Value = serde_json::from_str(&output.output).unwrap();
     let urls = |output: &serde_json::Value| {

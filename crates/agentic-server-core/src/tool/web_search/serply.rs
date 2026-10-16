@@ -237,8 +237,9 @@ impl SerplySearchRequest {
             .or_else(|| args.country.clone())
             .map(|value| value.to_ascii_lowercase());
 
+        // Date operators go before the `site:` list: Google ignores terms past
+        // the 32nd word, and unlike domains they are not re-checked client-side.
         let mut q = query.trim().to_owned();
-        push_site_operators(&mut q, include_domains.as_deref(), exclude_domains.as_deref());
         let tbs = match args.freshness {
             Some(Freshness::Range { from, to }) => {
                 // Google's `before:` is exclusive, so the inclusive range end is widened by a day.
@@ -252,6 +253,7 @@ impl SerplySearchRequest {
             Some(freshness) => serply_tbs(freshness),
             None => None,
         };
+        push_site_operators(&mut q, include_domains.as_deref(), exclude_domains.as_deref());
 
         Ok(Self {
             q,
@@ -629,6 +631,21 @@ mod tests {
         let request = build_request(r#"{"query":"q","freshness":"2026-01-02to2026-12-31"}"#);
         assert_eq!(request.q, "q after:2026-01-02 before:2027-01-01");
         assert_eq!(request.tbs, None);
+    }
+
+    #[test]
+    fn date_operators_precede_a_long_site_list() {
+        let domains: Vec<String> = (0..20).map(|i| format!("\"d{i}.com\"")).collect();
+        let request = build_request(&format!(
+            r#"{{"query":"q","freshness":"2026-01-02to2026-12-31","include_domains":[{}]}}"#,
+            domains.join(",")
+        ));
+        assert!(
+            request
+                .q
+                .starts_with("q after:2026-01-02 before:2027-01-01 site:d0.com OR ")
+        );
+        assert!(request.q.ends_with(" OR site:d19.com"));
     }
 
     #[test]
